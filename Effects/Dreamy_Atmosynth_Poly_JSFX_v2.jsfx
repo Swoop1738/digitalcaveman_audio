@@ -1,0 +1,421 @@
+desc:Dreamy Atmosynth Poly v2 (Standalone JSFX Instrument)
+
+slider1:0<0,7,1{Dream Keys,Dusty Pad,VHS Bell,Dark Drone,Soft Pluck,Wide Pad,Air Bell,Dirty Texture}>Preset
+slider2:0<-24,24,1>Transpose (semitones)
+slider3:0.58<0,1,0.01>Brightness
+slider4:0.00<0,1,0.01>Dust
+slider5:0.32<0,1,0.01>Detune/Wide
+slider6:0.01<0.001,5,0.001>Attack (s)
+slider7:0.30<0.01,8,0.01>Release (s)
+slider8:0.22<0,1,0.01>Movement
+slider9:0.80<0,1,0.01>Output
+slider10:0<0,1,1{Poly,Mono}>Poly/Mono
+slider11:0.00<0,2,0.001>Glide Time (s)
+slider12:0<0,2,1{Off,Legato Only,Always}>Glide Mode
+slider13:0<0,1,1{Off,Panic}>Panic
+
+in_pin:none
+out_pin:left
+out_pin:right
+
+@init
+voices = 16;
+max_events = 256;
+
+// Explicit, non-overlapping JSFX memory regions.
+base_active = 0;
+base_note = 32;
+base_target_freq = 64;
+base_current_freq = 96;
+base_vel = 128;
+base_gate = 160;
+base_env = 192;
+base_releasing = 224;
+base_phase1 = 256;
+base_phase2 = 288;
+base_phase3 = 320;
+base_filtL = 352;
+base_filtR = 384;
+base_dust = 416;
+base_age = 448;
+base_pan = 480;
+base_start_freq = 512;
+base_held = 640;       // 128 MIDI notes.
+base_evt_offs = 800;   // 256 queued event offsets.
+base_evt_msg1 = 1088;  // 256 queued msg1 values.
+base_evt_msg23 = 1376; // 256 queued msg23 values.
+
+pi = 3.141592653589793;
+two_pi = 2*pi;
+inv_srate = 1/srate;
+min_attack_s = 0.005; // Internal anti-click minimum, even if the GUI slider is lower.
+noise_seed = 0.314159;
+global_age = 1;
+lfo_phase = 0;
+last_preset = -1;
+last_freq = 261.625565;
+held_count = 0;
+mono_voice = 0;
+block_pos = 0;
+evt_count = 0;
+evt_index = 0;
+
+function clamp(x lo hi) (
+  x < lo ? lo : x > hi ? hi : x;
+);
+
+function note_to_freq(n) (
+  440 * 2^((n - 69) / 12);
+);
+
+function wrap01(x) (
+  x - floor(x);
+);
+
+function tri(p) local(t) (
+  t = wrap01(p);
+  4 * abs(t - 0.5) - 1;
+);
+
+function saw(p) local(t) (
+  t = wrap01(p);
+  2 * t - 1;
+);
+
+function softclip(x) (
+  x / (1 + abs(x));
+);
+
+function rand_uni() (
+  noise_seed = noise_seed * 12.9898 + 78.233;
+  noise_seed = wrap01(noise_seed);
+  noise_seed * 2 - 1;
+);
+
+function clear_voice(v) (
+  base_active[v] = 0;
+  base_gate[v] = 0;
+  base_env[v] = 0;
+  base_releasing[v] = 0;
+  base_filtL[v] = 0;
+  base_filtR[v] = 0;
+  base_dust[v] = 0;
+);
+
+function panic_all() local(i) (
+  i = 0;
+  loop(voices,
+    clear_voice(i);
+    i += 1;
+  );
+  i = 0;
+  loop(128,
+    base_held[i] = 0;
+    i += 1;
+  );
+  held_count = 0;
+);
+
+function remember_note_on(n) (
+  base_held[n] < 0.5 ? (
+    base_held[n] = 1;
+    held_count += 1;
+  );
+);
+
+function remember_note_off(n) (
+  base_held[n] > 0.5 ? (
+    base_held[n] = 0;
+    held_count -= 1;
+    held_count < 0 ? held_count = 0;
+  );
+);
+
+function highest_held_note() local(i found) (
+  found = -1;
+  i = 127;
+  loop(128,
+    found < 0 && base_held[i] > 0.5 ? found = i;
+    i -= 1;
+  );
+  found;
+);
+
+function choose_voice() local(i best bestenv oldest oldestage) (
+  best = -1;
+  bestenv = 999;
+  oldest = 0;
+  oldestage = 999999999;
+  i = 0;
+  loop(voices,
+    base_active[i] < 0.5 && best < 0 ? best = i;
+    (best < 0 && base_releasing[i] > 0.5 && base_env[i] < bestenv) ? (
+      best = i;
+      bestenv = base_env[i];
+    );
+    base_age[i] < oldestage ? (
+      oldest = i;
+      oldestage = base_age[i];
+    );
+    i += 1;
+  );
+  best < 0 ? best = oldest;
+  best;
+);
+
+function setup_voice(v note vel start_freq do_glide reset_env) local(target spread) (
+  target = note_to_freq(note + transpose_amt);
+  base_active[v] = 1;
+  base_note[v] = note;
+  base_target_freq[v] = target;
+  base_current_freq[v] = do_glide > 0.5 ? start_freq : target;
+  base_start_freq[v] = base_current_freq[v];
+  base_vel[v] = vel / 127;
+  base_gate[v] = 1;
+  base_releasing[v] = 0;
+  reset_env > 0.5 ? base_env[v] = 0;
+  reset_env > 0.5 ? (
+    base_filtL[v] = 0;
+    base_filtR[v] = 0;
+    base_dust[v] = 0;
+  );
+  base_phase1[v] = reset_env > 0.5 ? 0 : base_phase1[v];
+  base_phase2[v] = reset_env > 0.5 ? 0.17 : base_phase2[v];
+  base_phase3[v] = reset_env > 0.5 ? 0.37 : base_phase3[v];
+  spread = (v / max(1, voices - 1) - 0.5);
+  base_pan[v] = spread;
+  base_age[v] = global_age;
+  global_age += 1;
+  last_freq = target;
+);
+
+function note_on(note vel) local(v target legato do_glide start_freq reset_env) (
+  legato = held_count > 0;
+  remember_note_on(note);
+  target = note_to_freq(note + transpose_amt);
+  do_glide = 0;
+  glide_mode == 2 ? do_glide = 1;
+  glide_mode == 1 && legato ? do_glide = 1;
+  glide_time <= 0.00001 ? do_glide = 0;
+
+  mono_mode > 0.5 ? (
+    v = mono_voice;
+    start_freq = base_active[v] > 0.5 ? base_current_freq[v] : last_freq;
+    reset_env = base_active[v] > 0.5 && legato ? 0 : 1;
+    setup_voice(v, note, vel, start_freq, do_glide, reset_env);
+  ) : (
+    v = choose_voice();
+    start_freq = glide_mode == 2 ? last_freq : target;
+    setup_voice(v, note, vel, start_freq, do_glide, 1);
+  );
+);
+
+function release_note(note) local(i next_note) (
+  remember_note_off(note);
+
+  mono_mode > 0.5 ? (
+    next_note = highest_held_note();
+    next_note >= 0 ? (
+      base_note[mono_voice] == note ? (
+        setup_voice(mono_voice, next_note, 100, base_current_freq[mono_voice], glide_time > 0 && glide_mode > 0, 0);
+      );
+    ) : (
+      base_active[mono_voice] > 0.5 ? (
+        base_gate[mono_voice] = 0;
+        base_releasing[mono_voice] = 1;
+      );
+    );
+  ) : (
+    i = 0;
+    loop(voices,
+      base_active[i] > 0.5 && base_note[i] == note ? (
+        base_gate[i] = 0;
+        base_releasing[i] = 1;
+      );
+      i += 1;
+    );
+  );
+);
+
+function all_notes_off() local(i) (
+  i = 0;
+  loop(128,
+    base_held[i] = 0;
+    i += 1;
+  );
+  held_count = 0;
+  i = 0;
+  loop(voices,
+    base_active[i] > 0.5 ? (
+      base_gate[i] = 0;
+      base_releasing[i] = 1;
+    );
+    i += 1;
+  );
+);
+
+function apply_preset_defaults(p) (
+  p == 0 ? (slider3=0.58; slider4=0.00; slider5=0.32; slider6=0.010; slider7=0.30; slider8=0.22; slider9=0.80; slider11=0.000; slider12=0;)
+  : p == 1 ? (slider3=0.38; slider4=0.30; slider5=0.55; slider6=0.280; slider7=2.40; slider8=0.45; slider9=0.76; slider11=0.020; slider12=2;)
+  : p == 2 ? (slider3=0.72; slider4=0.20; slider5=0.28; slider6=0.006; slider7=1.20; slider8=0.28; slider9=0.72; slider11=0.000; slider12=0;)
+  : p == 3 ? (slider3=0.22; slider4=0.10; slider5=0.42; slider6=0.600; slider7=4.00; slider8=0.55; slider9=0.70; slider11=0.080; slider12=2;)
+  : p == 4 ? (slider3=0.62; slider4=0.04; slider5=0.20; slider6=0.004; slider7=0.22; slider8=0.16; slider9=0.78; slider11=0.030; slider12=1;)
+  : p == 5 ? (slider3=0.48; slider4=0.08; slider5=0.78; slider6=0.450; slider7=3.20; slider8=0.38; slider9=0.76; slider11=0.040; slider12=2;)
+  : p == 6 ? (slider3=0.84; slider4=0.06; slider5=0.24; slider6=0.008; slider7=1.00; slider8=0.20; slider9=0.72; slider11=0.000; slider12=0;)
+  : (slider3=0.42; slider4=0.45; slider5=0.50; slider6=0.040; slider7=1.80; slider8=0.48; slider9=0.70; slider11=0.020; slider12=2;);
+
+  // REAPER supports sliderchange(mask). Bits 1..12 update sliders 2..13 visibly after a preset jump.
+  sliderchange(8190);
+);
+
+function update_preset_color(p) (
+  p == 0 ? (wave_mix=0.18; bell_mix=0.05; sub_mix=0.12; cutoff_base=0.42; dust_trim=0.20; amp_trim=0.62; rel_scale=1.0;)
+  : p == 1 ? (wave_mix=0.45; bell_mix=0.05; sub_mix=0.22; cutoff_base=0.28; dust_trim=0.55; amp_trim=0.56; rel_scale=1.4;)
+  : p == 2 ? (wave_mix=0.08; bell_mix=0.55; sub_mix=0.02; cutoff_base=0.48; dust_trim=0.36; amp_trim=0.54; rel_scale=1.0;)
+  : p == 3 ? (wave_mix=0.70; bell_mix=0.00; sub_mix=0.38; cutoff_base=0.16; dust_trim=0.24; amp_trim=0.52; rel_scale=1.6;)
+  : p == 4 ? (wave_mix=0.34; bell_mix=0.10; sub_mix=0.04; cutoff_base=0.38; dust_trim=0.22; amp_trim=0.60; rel_scale=0.8;)
+  : p == 5 ? (wave_mix=0.36; bell_mix=0.04; sub_mix=0.25; cutoff_base=0.32; dust_trim=0.24; amp_trim=0.54; rel_scale=1.5;)
+  : p == 6 ? (wave_mix=0.00; bell_mix=0.65; sub_mix=0.00; cutoff_base=0.55; dust_trim=0.20; amp_trim=0.52; rel_scale=1.0;)
+  : (wave_mix=0.62; bell_mix=0.12; sub_mix=0.24; cutoff_base=0.24; dust_trim=0.70; amp_trim=0.50; rel_scale=1.2;);
+);
+
+@slider
+preset = slider1;
+preset != last_preset ? (
+  apply_preset_defaults(preset);
+  last_preset = preset;
+);
+
+transpose_amt = slider2;
+bright_amt = clamp(slider3, 0, 1);
+dust_amt = clamp(slider4, 0, 1);
+detune_amt = clamp(slider5, 0, 1);
+attack_s = max(min_attack_s, slider6);
+release_s = max(0.02, slider7);
+move_amt = clamp(slider8, 0, 1);
+out_amt = clamp(slider9, 0, 1);
+mono_mode = slider10;
+glide_time = max(0, slider11);
+glide_mode = slider12;
+
+slider13 > 0.5 ? (
+  panic_all();
+  slider13 = 0;
+  sliderchange(4096);
+);
+
+update_preset_color(preset);
+attack_inc = 1 / max(1, attack_s * srate);
+release_dec = 1 / max(1, release_s * rel_scale * srate);
+glide_coef = glide_time <= 0.00001 ? 1 : 1 - exp(-1 / max(1, glide_time * srate));
+
+@block
+block_pos = 0;
+evt_count = 0;
+evt_index = 0;
+while (midirecv(offset, msg1, msg23)) (
+  evt_count < max_events ? (
+    base_evt_offs[evt_count] = offset;
+    base_evt_msg1[evt_count] = msg1;
+    base_evt_msg23[evt_count] = msg23;
+    evt_count += 1;
+  );
+);
+// Events are queued and consumed in @sample when block_pos reaches their offset,
+// so Piano-Roll/MIDI-item notes remain sample-accurate without risky audio buffers.
+
+@sample
+while (evt_index < evt_count && base_evt_offs[evt_index] <= block_pos) (
+  msg1 = base_evt_msg1[evt_index];
+  msg23 = base_evt_msg23[evt_index];
+  status = msg1 & 240;
+  note = msg23 & 127;
+  vel = (msg23 >> 8) & 127;
+  cc = msg23 & 127;
+  ccval = (msg23 >> 8) & 127;
+
+  status == 144 && vel > 0 ? (
+    note_on(note, vel);
+  ) : ((status == 128) || (status == 144 && vel == 0)) ? (
+    release_note(note);
+  ) : (status == 176 && cc == 123) ? (
+    all_notes_off();
+  );
+  evt_index += 1;
+);
+block_pos += 1;
+
+lfo_phase += (0.025 + move_amt * 0.10) * inv_srate;
+lfo_phase = wrap01(lfo_phase);
+lfo = sin(two_pi * lfo_phase);
+
+sumL = 0;
+sumR = 0;
+scale = 0.20;
+
+i = 0;
+loop(voices,
+  base_active[i] > 0.5 ? (
+    env = base_env[i];
+    base_gate[i] > 0.5 ? (
+      env += attack_inc;
+      env > 1 ? env = 1;
+    ) : (
+      env -= release_dec;
+      env <= 0.000001 ? (
+        env = 0;
+        clear_voice(i);
+      );
+    );
+    base_env[i] = env;
+
+    base_active[i] > 0.5 ? (
+      cur = base_current_freq[i];
+      target = base_target_freq[i];
+      cur += (target - cur) * glide_coef;
+      base_current_freq[i] = cur;
+
+      bend = 1 + lfo * move_amt * 0.002;
+      det = detune_amt * 0.005;
+      inc1 = cur * bend * inv_srate;
+      inc2 = cur * (1 + det) * (1 - lfo * move_amt * 0.0008) * inv_srate;
+      inc3 = cur * 2.01 * inv_srate;
+
+      ph1 = wrap01(base_phase1[i] + inc1);
+      ph2 = wrap01(base_phase2[i] + inc2);
+      ph3 = wrap01(base_phase3[i] + inc3);
+      base_phase1[i] = ph1;
+      base_phase2[i] = ph2;
+      base_phase3[i] = ph3;
+
+      s1 = sin(two_pi * ph1);
+      t1 = tri(ph1);
+      sw = saw(ph2);
+      bp = sin(two_pi * ph3) * bell_mix;
+      osc = (s1 * (1 - wave_mix) + t1 * wave_mix * 0.72 + sw * wave_mix * 0.28) * (1 - bell_mix * 0.35) + bp;
+      osc += sin(two_pi * wrap01(ph1 * 0.5)) * sub_mix;
+
+      dust_state = base_dust[i] * 0.98 + rand_uni() * 0.02;
+      base_dust[i] = dust_state;
+      dust_sig = dust_state * dust_amt * dust_trim * 0.10;
+
+      sig = (osc + dust_sig) * env * base_vel[i] * amp_trim;
+
+      cutoff = cutoff_base + bright_amt * 0.48 + lfo * move_amt * 0.07;
+      cutoff = clamp(cutoff, 0.025, 0.96);
+      coef = cutoff * cutoff;
+      fl = base_filtL[i] + coef * (sig - base_filtL[i]);
+      fr = base_filtR[i] + coef * (sig - base_filtR[i]);
+      base_filtL[i] = fl;
+      base_filtR[i] = fr;
+
+      pan = base_pan[i] * detune_amt * 0.65;
+      sumL += fl * (0.707 - pan);
+      sumR += fr * (0.707 + pan);
+    );
+  );
+  i += 1;
+);
+
+spl0 = softclip(sumL * scale * out_amt * 2.0);
+spl1 = softclip(sumR * scale * out_amt * 2.0);

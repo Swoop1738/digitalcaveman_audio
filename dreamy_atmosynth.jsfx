@@ -1,0 +1,266 @@
+desc:Dreamy Atmosynth (Poly JSFX Instrument)
+
+slider1:0<0,7,1{Dream Keys,Dusty Pad,VHS Bell,Dark Drone,Soft Pluck,Wide Pad,Air Bell,Dirty Texture}>Preset
+slider2:0<-24,24,1>Transpose (semitones)
+slider3:0.55<0,1,0.01>Brightness
+slider4:0.00<0,1,0.01>Dust
+slider5:0.35<0,1,0.01>Detune/Wide
+slider6:0.01<0.001,5,0.001>Attack (s)
+slider7:0.30<0.01,8,0.01>Release (s)
+slider8:0.25<0,1,0.01>Movement
+slider9:0.80<0,1,0.01>Output
+slider10:0<0,1,1{Poly,Mono}>Poly/Mono
+slider11:0<0,1,1{Off,Panic}>Panic
+
+in_pin:none
+out_pin:left
+out_pin:right
+
+@init
+voices = 12;
+
+// Explicitly separated JSFX memory regions. Each voice uses one cell per region.
+base_active = 0;
+base_note = 32;
+base_vel = 64;
+base_gate = 96;
+base_env = 128;
+base_phase1 = 160;
+base_phase2 = 192;
+base_filtL = 224;
+base_filtR = 256;
+base_age = 288;
+base_rel = 320;
+
+pi = 3.141592653589793;
+two_pi = 2*pi;
+inv_srate = 1/srate;
+noise_seed = 0.12345;
+global_age = 1;
+lfo_phase = 0;
+
+function clamp(x lo hi) (
+  x < lo ? lo : x > hi ? hi : x;
+);
+
+function midi_note_to_freq(n) (
+  440 * 2^((n - 69) / 12);
+);
+
+function tri_wave(p) local(t) (
+  t = p - floor(p);
+  4 * abs(t - 0.5) - 1;
+);
+
+function saw_wave(p) local(t) (
+  t = p - floor(p);
+  2 * t - 1;
+);
+
+function softclip(x) (
+  x / (1 + abs(x));
+);
+
+function rand_uni() (
+  noise_seed = noise_seed * 12.9898 + 78.233;
+  noise_seed = noise_seed - floor(noise_seed);
+  noise_seed * 2 - 1;
+);
+
+function panic_all() local(i) (
+  i = 0;
+  loop(voices,
+    base_active[i] = 0;
+    base_gate[i] = 0;
+    base_env[i] = 0;
+    base_rel[i] = 0;
+    base_filtL[i] = 0;
+    base_filtR[i] = 0;
+    i += 1;
+  );
+);
+
+function start_voice(note vel) local(i best bestenv bestage target freq det) (
+  // Mono mode clears old notes first for predictable bass/lead-style playing.
+  mono_mode > 0.5 ? panic_all();
+
+  best = 0;
+  bestenv = 999;
+  bestage = 999999999;
+  i = 0;
+  loop(voices,
+    base_active[i] < 0.5 ? (
+      best = i;
+      bestenv = -1;
+      i = voices;
+    ) : (
+      (base_gate[i] < 0.5 && base_env[i] < bestenv) ? (
+        best = i;
+        bestenv = base_env[i];
+      ) : (bestenv >= 999 && base_age[i] < bestage ? (
+        best = i;
+        bestage = base_age[i];
+      ));
+    );
+    i += 1;
+  );
+
+  target = note + transpose_amt;
+  freq = midi_note_to_freq(target);
+  det = (rand_uni() * 0.003 * detune_amt);
+
+  base_active[best] = 1;
+  base_note[best] = note;
+  base_vel[best] = vel / 127;
+  base_gate[best] = 1;
+  base_phase1[best] = 0;
+  base_phase2[best] = 0.25 + det;
+  base_env[best] = 0;
+  base_rel[best] = 0;
+  base_filtL[best] = 0;
+  base_filtR[best] = 0;
+  base_age[best] = global_age;
+  global_age += 1;
+);
+
+function release_voice(note) local(i) (
+  i = 0;
+  loop(voices,
+    (base_active[i] > 0.5 && base_note[i] == note) ? (
+      base_gate[i] = 0;
+      base_rel[i] = 1;
+    );
+    i += 1;
+  );
+);
+
+@slider
+preset = slider1;
+transpose_amt = slider2;
+bright_amt = clamp(slider3, 0, 1);
+dust_amt = clamp(slider4, 0, 1);
+detune_amt = clamp(slider5, 0, 1);
+attack_s = max(0.001, slider6);
+release_s = max(0.01, slider7);
+move_amt = clamp(slider8, 0, 1);
+out_amt = clamp(slider9, 0, 1);
+mono_mode = slider10;
+
+panic_now = slider11;
+panic_now > 0.5 ? (
+  panic_all();
+  slider11 = 0;
+);
+
+// Preset trims keep every mode immediately audible and safely leveled.
+preset == 0 ? (wave_mix=0.15; sub_mix=0.18; dust_trim=0.30; cutoff_base=0.55; amp_trim=0.75; rel_scale=1.0;)
+: preset == 1 ? (wave_mix=0.45; sub_mix=0.25; dust_trim=0.55; cutoff_base=0.35; amp_trim=0.65; rel_scale=2.2;)
+: preset == 2 ? (wave_mix=0.05; sub_mix=0.05; dust_trim=0.25; cutoff_base=0.75; amp_trim=0.65; rel_scale=1.4;)
+: preset == 3 ? (wave_mix=0.70; sub_mix=0.45; dust_trim=0.20; cutoff_base=0.22; amp_trim=0.55; rel_scale=3.0;)
+: preset == 4 ? (wave_mix=0.35; sub_mix=0.08; dust_trim=0.18; cutoff_base=0.62; amp_trim=0.70; rel_scale=0.55;)
+: preset == 5 ? (wave_mix=0.35; sub_mix=0.35; dust_trim=0.25; cutoff_base=0.48; amp_trim=0.68; rel_scale=2.5;)
+: preset == 6 ? (wave_mix=0.00; sub_mix=0.03; dust_trim=0.18; cutoff_base=0.82; amp_trim=0.62; rel_scale=1.2;)
+: (wave_mix=0.65; sub_mix=0.30; dust_trim=0.75; cutoff_base=0.40; amp_trim=0.58; rel_scale=1.8;);
+
+attack_inc = 1 / max(1, attack_s * srate);
+release_dec = 1 / max(1, release_s * rel_scale * srate);
+
+@block
+while (midirecv(offset, msg1, msg23)) (
+  status = msg1 & 240;
+  note = msg23 & 127;
+  vel = (msg23 / 256) & 127;
+
+  status == 144 && vel > 0 ? (
+    start_voice(note, vel);
+  ) : ((status == 128) || (status == 144 && vel == 0)) ? (
+    release_voice(note);
+  );
+);
+
+@sample
+lfo_phase += (0.035 + move_amt * 0.12) * inv_srate;
+lfo_phase >= 1 ? lfo_phase -= 1;
+lfo = sin(two_pi * lfo_phase);
+
+sumL = 0;
+sumR = 0;
+active_count = 0;
+
+i = 0;
+loop(voices,
+  base_active[i] > 0.5 ? (
+    active_count += 1;
+
+    env = base_env[i];
+    base_gate[i] > 0.5 ? (
+      env += attack_inc;
+      env > 1 ? env = 1;
+    ) : (
+      env -= release_dec;
+      env <= 0.00001 ? (
+        env = 0;
+        base_active[i] = 0;
+      );
+    );
+    base_env[i] = env;
+
+    base_active[i] > 0.5 ? (
+      note = base_note[i] + transpose_amt;
+      freq = midi_note_to_freq(note);
+      bend = 1 + (lfo * move_amt * 0.0025);
+      wide = detune_amt * 0.006;
+      inc1 = freq * bend * inv_srate;
+      inc2 = freq * (1 + wide) * (1 - lfo * move_amt * 0.001) * inv_srate;
+
+      ph1 = base_phase1[i] + inc1;
+      ph2 = base_phase2[i] + inc2;
+      ph1 -= floor(ph1);
+      ph2 -= floor(ph2);
+      base_phase1[i] = ph1;
+      base_phase2[i] = ph2;
+
+      sine1 = sin(two_pi * ph1);
+      sine2 = sin(two_pi * ph2);
+      tri1 = tri_wave(ph1);
+      saw1 = saw_wave(ph1);
+      oscA = sine1 * (1 - wave_mix) + tri1 * wave_mix;
+      oscB = sine2 * (1 - wave_mix * 0.5) + saw1 * (wave_mix * 0.5);
+
+      // Preset color: bells/plucks get a clean upper partial, drones/pads get more body.
+      bell = sin(two_pi * (ph1 * 2.01 - floor(ph1 * 2.01))) * 0.35;
+      preset == 2 || preset == 6 ? osc = oscA * 0.70 + bell * 0.30 : osc = oscA * 0.72 + oscB * 0.28;
+      osc += sin(two_pi * (ph1 * 0.5 - floor(ph1 * 0.5))) * sub_mix;
+
+      dust = rand_uni() * dust_amt * dust_trim * 0.08;
+      sig = (osc + dust) * env * base_vel[i] * amp_trim;
+
+      cutoff = cutoff_base + bright_amt * 0.42 + lfo * move_amt * 0.08;
+      cutoff = clamp(cutoff, 0.03, 0.98);
+      coef = cutoff * cutoff;
+      fl = base_filtL[i] + coef * (sig - base_filtL[i]);
+      fr = base_filtR[i] + coef * (sig - base_filtR[i]);
+      base_filtL[i] = fl;
+      base_filtR[i] = fr;
+
+      pan = (i / max(1, voices - 1) - 0.5) * detune_amt * 0.55;
+      sumL += fl * (0.707 - pan);
+      sumR += fr * (0.707 + pan);
+    );
+  );
+  i += 1;
+);
+
+// No free-running noise bed: Dust is voice-envelope-gated, so silence stays silent.
+gain_comp = active_count > 3 ? 3 / active_count : 1;
+spl0 = softclip(sumL * gain_comp * out_amt * 1.4);
+spl1 = softclip(sumR * gain_comp * out_amt * 1.4);
+
+// Testanleitung:
+// 1. Datei speichern unter ~/.config/REAPER/Effects/dreamy_atmosynth.jsfx
+// 2. REAPER FX Browser neu scannen.
+// 3. Plugin auf eine neue Spur laden.
+// 4. MIDI-Item mit Noten auf derselben Spur erstellen.
+// 5. Preset Dream Keys testen mit Dust 0, Attack 0.01, Release 0.3, Output 0.8.
+// Wichtigster Test: Mit Dust = 0, Preset = Dream Keys, Attack = 0.01,
+// Release = 0.3 und Output = 0.8 muss beim Spielen einer MIDI-Note ein klarer Ton hörbar sein.
